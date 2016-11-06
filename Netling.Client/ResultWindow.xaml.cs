@@ -1,114 +1,169 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
-using System.IO;
 using System.Linq;
-using System.Text;
+using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Media;
 using Netling.Core.Models;
 using OxyPlot;
-using OxyPlot.Axes;
-using OxyPlot.Series;
 
 namespace Netling.Client
 {
-    public partial class ResultWindow : Window
+    public partial class ResultWindow
     {
-        public JobResult<UrlResult> Result { get; private set; }
+        private ResultWindowItem _resultWindowItem;
+        private readonly MainWindow _sender;
 
-        public ResultWindow(JobResult<UrlResult> result)
+        public ResultWindow(MainWindow sender)
         {
+            _sender = sender;
             InitializeComponent();
-            Result = result;
-
-            TotalRequests.Text = result.Count.ToString(CultureInfo.InvariantCulture);
-            RequestsPerSecond.Text = string.Format("{0:0}", result.JobsPerSecond);
-            ResponseTime.Text = string.Format("{0:0}", result.Results.Where(r => !r.IsError).DefaultIfEmpty(new UrlResult(0, 0, DateTime.Now, null, 0)).Average(r => r.ResponseTime));
-            Elapsed.Text = string.Format("{0:0}", result.ElapsedMilliseconds);
-            Bandwidth.Text = string.Format("{0:0}", Math.Round(result.BytesPrSecond * 8 / 1024 / 1024, MidpointRounding.AwayFromZero));
-            Errors.Text = result.Errors.ToString(CultureInfo.InvariantCulture);
-
-            //Title = string.Format("{0} threads, {1:0.#} seconds duration & {2} URLs", result.Threads, result.ElapsedMilliseconds / 1000, result.Results.Select(r => r.Url).Distinct().Count());
-
-            LoadUrlSummary();
-            LoadGraphs();
         }
 
-        private void LoadGraphs()
+        public async Task Load(WorkerResult workerResult)
         {
-            long startTime = 0;
+            var taskResult = await GenerateAsync(workerResult);
+            _resultWindowItem = taskResult.ResultWindowItem;
 
-            if (Result.Results.Any())
-                startTime = Result.Results.First().StartTime.Ticks;
+            RequestsPerSecondGraph.Draw(taskResult.Throughput, "{Y:#,0} rps");
+            var dataPoints = workerResult.Histogram.Select((count, i) => new DataPoint(i / 80.0 * (_resultWindowItem.Max - _resultWindowItem.Min) + _resultWindowItem.Min, count)).ToList();
+            HistogramGraph.Draw(dataPoints, "{X:0.000} ms");
 
-            var result = Result.Results
-                .Where(r => !r.IsError)
-                .GroupBy(r => ((r.StartTime.Ticks - startTime) / 10000 + r.ResponseTime) / 1000)
-                .OrderBy(r => r.Key)
-                .Select(r => new DataPoint(r.Key, r.Count()));
+            Title = "Netling - " + _resultWindowItem.Url;
+            ThreadsValueUserControl.Value = _resultWindowItem.Threads.ToString();
+            PipeliningValueUserControl.Value = _resultWindowItem.Pipelining.ToString();
+            ThreadAffinityValueUserControl.Value = _resultWindowItem.ThreadAffinity ? "ON" : "OFF";
 
-            RequestsPerSecondGraph.Draw(result);
+            RequestsValueUserControl.Value = _resultWindowItem.JobsPerSecond.ToString("#,0");
+            ElapsedValueUserControl.Value = $"{_resultWindowItem.ElapsedSeconds:0}";
+            BandwidthValueUserControl.Value = _resultWindowItem.Bandwidth.ToString("#,0");
+            ErrorsValueUserControl.Value = _resultWindowItem.Errors.ToString("#,0");
+            MedianValueUserControl.Value = string.Format(_resultWindowItem.Median > 5 ? "{0:#,0}" : "{0:0.000}", _resultWindowItem.Median);
+            StdDevValueUserControl.Value = string.Format(_resultWindowItem.StdDev > 5 ? "{0:#,0}" : "{0:0.000}", _resultWindowItem.StdDev);
+            MinValueUserControl.Value = string.Format(_resultWindowItem.Min > 5 ? "{0:#,0}" : "{0:0.000}", _resultWindowItem.Min);
+            MaxValueUserControl.Value = string.Format(_resultWindowItem.Max > 5 ? "{0:#,0}" : "{0:0.000}", _resultWindowItem.Max);
+            MinTextBlock.Text = MinValueUserControl.Value + " ms";
+            MaxTextBlock.Text = MaxValueUserControl.Value + " ms";
 
-            var i = 1;
-            var ms = Result.Results
-                .Where(r => !r.IsError)
-                .OrderByDescending(r => r.ResponseTime)
-                .Select(r => new DataPoint(i++, r.ResponseTime));
+            var errors = new Dictionary<string, string>();
 
-            ResponseTimeGraph.Draw(ms);
-        }
-
-        private void LoadUrlSummary()
-        {
-            var list = new List<SummaryResult>();
-            foreach (var url in Result.Results.Select(r => r.Url).Distinct())
+            foreach (var statusCode in workerResult.StatusCodes)
             {
-                var urlResult = Result.Results.Where(r => r.Url == url).ToList();
-                var responseTime = urlResult.Where(r => !r.IsError).DefaultIfEmpty(new UrlResult(0, 0, DateTime.Now, null, 0)).Average(r => r.ResponseTime);
-
-                list.Add(new SummaryResult
-                    {
-                        Url = url,
-                        ResponseTime = (int)responseTime,
-                        Errors = urlResult.Count(r => r.IsError),
-                        Size = string.Format("{0:0.0}", urlResult.Where(r => !r.IsError).DefaultIfEmpty(new UrlResult(0, 0, DateTime.Now, null, 0)).Average(r => r.Bytes) / 1024)
-                    });
+                errors.Add(statusCode.Key.ToString(), statusCode.Value.ToString("#,0"));
             }
 
-            UrlSummary.ItemsSource = list;
+            foreach (var exception in workerResult.Exceptions)
+            {
+                errors.Add(exception.Key.ToString(), exception.Value.ToString("#,0"));
+            }
+
+            ErrorsListView.ItemsSource = errors;
+
+            if (_sender.ResultWindowItem != null)
+                LoadBaseline(_sender.ResultWindowItem);
         }
 
-        private void Button_Click(object sender, RoutedEventArgs e)
+        private Task<JobTaskResult> GenerateAsync(WorkerResult workerResult)
         {
-            var dialog = new Microsoft.Win32.SaveFileDialog
+            return Task.Run(() =>
+            {
+                var result = ResultWindowItem.Parse(workerResult);
+                var max = (int) Math.Floor(workerResult.Elapsed.TotalMilliseconds / 1000);
+
+                var throughput = workerResult.Seconds
+                    .Where(r => r.Key < max && r.Value.Count > 0)
+                    .OrderBy(r => r.Key)
+                    .Select(r => new DataPoint(r.Key, r.Value.Count));
+
+                return new JobTaskResult
                 {
-                    FileName = string.Format("Result-{0:yyyy.MM.dd_HHmm}", DateTime.Now),
-                    DefaultExt = ".csv",
-                    Filter = "Comma-separated values (.csv)|*.csv"
+                    ResultWindowItem = result,
+                    Throughput = throughput
                 };
+            });
+        }
 
-            if (dialog.ShowDialog() == true)
-            {
-                var sb = new StringBuilder();
-                sb.Append("StartTime;EndTime;Error;ThreadId;ResponseTime;Bytes;Url");
-                var startTimeZero = Result.Results.OrderBy(r => r.StartTime).First().StartTime.Ticks/10000;
+        private void UseBaseline(object sender, RoutedEventArgs e)
+        {
+            _sender.ResultWindowItem = _resultWindowItem;
+            LoadBaseline(_sender.ResultWindowItem);
+        }
 
-                foreach (var result in Result.Results)
-                {
-                    var startTime = result.StartTime.Ticks / 10000 - startTimeZero;
-                    sb.Append(string.Format("\r\n{0};{1};{2};{3};{4};{5};{6}", startTime, startTime + result.ResponseTime, result.IsError ? 1 : 0, result.ThreadId, result.ResponseTime, result.Bytes, result.Url));
-                }
+        private void ClearBaseline(object sender, RoutedEventArgs e)
+        {
+            _sender.ResultWindowItem = null;
+            ThreadsValueUserControl.BaselineValue = null;
+            PipeliningValueUserControl.BaselineValue = null;
+            ThreadAffinityValueUserControl.BaselineValue = null;
 
-                File.WriteAllText(dialog.FileName, sb.ToString());
-            }
+            RequestsValueUserControl.BaselineValue = null;
+            RequestsValueUserControl.BaseLine = BaseLine.Equal;
+
+            ElapsedValueUserControl.BaselineValue = null;
+            ElapsedValueUserControl.BaseLine = BaseLine.Equal;
+
+            BandwidthValueUserControl.BaselineValue = null;
+            BandwidthValueUserControl.BaseLine = BaseLine.Equal;
+
+            ErrorsValueUserControl.BaselineValue = null;
+            ErrorsValueUserControl.BaseLine = BaseLine.Equal;
+
+            MedianValueUserControl.BaselineValue = null;
+            MedianValueUserControl.BaseLine = BaseLine.Equal;
+
+            StdDevValueUserControl.BaselineValue = null;
+            StdDevValueUserControl.BaseLine = BaseLine.Equal;
+
+            MinValueUserControl.BaselineValue = null;
+            MinValueUserControl.BaseLine = BaseLine.Equal;
+
+            MaxValueUserControl.BaselineValue = null;
+            MaxValueUserControl.BaseLine = BaseLine.Equal;
+        }
+
+        private void LoadBaseline(ResultWindowItem baseline)
+        {
+            ThreadsValueUserControl.BaselineValue = baseline.Threads.ToString();
+            PipeliningValueUserControl.BaselineValue = baseline.Pipelining.ToString();
+            ThreadAffinityValueUserControl.BaselineValue = baseline.ThreadAffinity ? "ON" : "OFF";
+
+            RequestsValueUserControl.BaselineValue = $"{baseline.JobsPerSecond:#,0}";
+            RequestsValueUserControl.BaseLine = GetBaseline(_resultWindowItem.JobsPerSecond, baseline.JobsPerSecond);
+
+            ElapsedValueUserControl.BaselineValue = $"{baseline.ElapsedSeconds:#,0}";
+
+            BandwidthValueUserControl.BaselineValue = $"{baseline.Bandwidth:0}";
+            BandwidthValueUserControl.BaseLine = GetBaseline(_resultWindowItem.Bandwidth, baseline.Bandwidth);
+
+            ErrorsValueUserControl.BaselineValue = baseline.Errors.ToString();
+            ErrorsValueUserControl.BaseLine = GetBaseline(baseline.Errors, _resultWindowItem.Errors);
+
+            MedianValueUserControl.BaselineValue = string.Format(baseline.Median > 5 ? "{0:#,0}" : "{0:0.000}", baseline.Median);
+            MedianValueUserControl.BaseLine = GetBaseline(baseline.Median, _resultWindowItem.Median);
+
+            StdDevValueUserControl.BaselineValue = string.Format(baseline.StdDev > 5 ? "{0:#,0}" : "{0:0.000}", baseline.StdDev);
+            StdDevValueUserControl.BaseLine = GetBaseline(baseline.StdDev, _resultWindowItem.StdDev);
+
+            MinValueUserControl.BaselineValue = string.Format(baseline.Min > 5 ? "{0:#,0}" : "{0:0.000}", baseline.Min);
+            MinValueUserControl.BaseLine = GetBaseline(baseline.Min, _resultWindowItem.Min);
+
+            MaxValueUserControl.BaselineValue = string.Format(baseline.Max > 5 ? "{0:#,0}" : "{0:0.000}", baseline.Max);
+            MaxValueUserControl.BaseLine = GetBaseline(baseline.Max, _resultWindowItem.Max);
+        }
+
+        private BaseLine GetBaseline(double v1, double v2)
+        {
+            if (Math.Abs(v1 - v2) < 0.001)
+                return BaseLine.Equal;
+
+            return v1 > v2 ? BaseLine.Better : BaseLine.Worse;
         }
     }
 
-    public class SummaryResult
+    internal class JobTaskResult
     {
-        public string Url { get; set; }
-        public string Size { get; set; }
-        public int ResponseTime { get; set; }
-        public int Errors { get; set; }
+        public ResultWindowItem ResultWindowItem { get; set; }
+        public IEnumerable<DataPoint> Throughput { get; set; }
     }
 }

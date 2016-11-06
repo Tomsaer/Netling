@@ -1,19 +1,18 @@
 ﻿using System.Collections.Generic;
-using System.Windows.Controls;
 using OxyPlot;
 using OxyPlot.Axes;
 using OxyPlot.Series;
 
 namespace Netling.Client
 {
-    public partial class LineGraphControl : UserControl
+    public partial class LineGraphControl
     {
         public LineGraphControl()
         {
             InitializeComponent();
         }
 
-        public void Draw(IEnumerable<DataPoint> points)
+        public void Draw(IEnumerable<DataPoint> points, string trackerFormatString = null)
         {
             var plotModel = new PlotModel
             {
@@ -39,10 +38,19 @@ namespace Netling.Client
                 MajorGridlineStyle = LineStyle.Solid,
                 MinorGridlineStyle = LineStyle.Dot,
                 IsZoomEnabled = false,
-                IsPanEnabled = false
+                IsPanEnabled = false,
+                LabelFormatter = d => "",
+                AxisTickToLabelDistance = 0
             });
+            
+            var ls = new LineSeries
+            {
+                Color = OxyColor.Parse("#ff0079c5"),
+                CanTrackerInterpolatePoints = false
+            };
 
-            var ls = new LineSeries {Color = OxyColor.Parse("#ff0079c5")};
+            if (trackerFormatString != null)
+                ls.TrackerFormatString = trackerFormatString;
 
             foreach (var point in points)
             {
